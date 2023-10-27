@@ -18,6 +18,7 @@ import os
 import re
 from typing import Dict
 from unittest import mock
+import asyncio
 
 import avro.io
 import avro.schema
@@ -25,7 +26,10 @@ import pytest
 from cloudevents.conversion import to_binary, to_structured
 from cloudevents.http import CloudEvent
 from fastapi.testclient import TestClient
+import setproctitle
 from ray import serve
+from sse_starlette import EventSourceResponse
+import httpx_sse
 
 from kserve import Model, ModelServer, ModelRepository
 from kserve.errors import InvalidInput
@@ -34,6 +38,8 @@ from kserve.protocol.rest.server import RESTServer
 
 from kserve.protocol.infer_type import InferRequest
 from kserve.utils.utils import get_predict_input, get_predict_response
+
+from kserve import InferOutput, InferResponse
 
 test_avsc_schema = '''
         {
@@ -88,6 +94,42 @@ class DummyModel(Model):
     async def explain(self, request, headers=None):
         return {"predictions": request["instances"]}
 
+
+class DummyModelStream(Model):
+    def __init__(self, name):
+        super().__init__(name)
+        self.name = name
+        self.ready = False
+
+    def load(self):
+        self.ready = True
+
+    async def numbers(self, minimum, maximum):
+        for i in range(minimum, maximum + 1):
+            await asyncio.sleep(0.1)
+            infer_output = InferOutput(name="output-0", shape=list([1]), datatype="BYTES", data=list(["testing"]))
+            infer_response = InferResponse(response_id=i, model_name="test_model", infer_outputs=[infer_output])
+            infer_response = str(infer_response.to_rest())
+            yield infer_response
+
+    async def predict(self, request, headers=None):
+        generator = self.numbers(1, 5)
+        response = EventSourceResponse(generator)
+        print("predict headers:", str(response.headers))
+        return EventSourceResponse(generator)
+        # events = request["stream"] if isinstance(request, dict) and "stream" in request else False
+        # if events:
+        #     generator = self.numbers(1, 5)
+        #     return EventSourceResponse(generator)
+        # if isinstance(request, InferRequest):
+        #     inputs = get_predict_input(request)
+        #infer_response = get_predict_response(request, inputs, self.name)
+        #     return infer_response
+        # else:
+        #     return {"predictions": request["instances"]}
+
+    async def explain(self, request, headers=None):
+        return {"predictions": request["instances"]}
 
 @serve.deployment
 class DummyServeModel(Model):
@@ -197,6 +239,87 @@ class TestModel:
         bad_request = {"inputs": "invalid"}
         with pytest.raises(InvalidInput):
             model.validate(bad_request)
+
+
+class TestTFHttpServerStream:
+    @pytest.fixture(scope="class")
+    def app(self):  # pylint: disable=no-self-use
+        model = DummyModelStream("TestModelStream")
+        model.load()
+        server = ModelServer()
+        server.register_model(model)
+        rest_server = RESTServer(server.dataplane, server.model_repository_extension)
+        return rest_server.create_application()
+
+    @pytest.fixture(scope='class')
+    def http_server_client(self, app):
+        return TestClient(app, headers={"content-type": "application/json"})
+
+    def test_liveness(self, http_server_client):
+        resp = http_server_client.get('/')
+        assert resp.status_code == 200
+        assert resp.json() == {"status": "alive"}
+
+    def test_model(self, http_server_client):
+        resp = http_server_client.get('/v1/models/TestModel')
+        assert resp.status_code == 200
+
+    def test_unknown_model(self, http_server_client):
+        resp = http_server_client.get('/v1/models/InvalidModel')
+        assert resp.status_code == 404
+        assert resp.json() == {"error": "Model with name InvalidModel does not exist."}
+
+    def test_list_models(self, http_server_client):
+        resp = http_server_client.get('/v1/models')
+        assert resp.status_code == 200
+        assert resp.json() == {"models": ["TestModel"]}
+
+    def test_predict(self, http_server_client):
+        resp = http_server_client.post('/v1/models/TestModel:predict',
+                                       data=b'{"instances":[[1,2]]}')
+        assert resp.status_code == 200
+        assert resp.content == b'{"predictions":[[1,2]]}'
+        assert resp.headers['content-type'] == "application/json"
+
+    def test_predict_streams(self, http_server_client):
+        input_data = b'{"inputs": [{"name": "input-0","shape": [1, 2],"datatype": "INT32","data": [[1,2]]}]}'
+        with httpx_sse.connect_sse(http_server_client, "POST", '/v2/models/TestModelStream/infer',
+                                   data=input_data) as event_source:
+            assert event_source.response.status_code == 200
+            print("response:", str(event_source.response))
+            print("header:", str(event_source.response.headers))
+            for i, sse in enumerate(event_source.iter_sse()):
+                print("result is :", i, str(sse.data))
+              #  assert i + 1 == int(sse.data)
+           # assert event_source.response.headers['content-type'] == "text/event-stream; charset=utf-8"
+
+    def test_infer(self, http_server_client):
+        input_data = b'{"inputs": [{"name": "input-0","shape": [1, 2],"datatype": "INT32","data": [[1,2]]}]}'
+        resp = http_server_client.post('/v2/models/TestModelStream/infer',
+                                       data=input_data)
+
+        result = json.loads(resp.content)
+        assert resp.status_code == 200
+        assert result["outputs"][0]["data"] == [1, 2]
+        assert resp.headers['content-type'] == "application/json"
+
+    def test_explain(self, http_server_client):
+        resp = http_server_client.post('/v1/models/TestModel:explain',
+                                       data=b'{"instances":[[1,2]]}')
+        assert resp.status_code == 200
+        assert resp.content == b'{"predictions":[[1,2]]}'
+        assert resp.headers['content-type'] == "application/json"
+
+    def test_unknown_path(self, http_server_client):
+        resp = http_server_client.get('/unknown_path')
+        assert resp.status_code == 404
+        assert resp.json() == {"detail": "Not Found"}
+
+    def test_metrics(self, http_server_client):
+        resp = http_server_client.get('/metrics')
+        assert resp.status_code == 200
+        assert resp.content is not None
+
 
 
 class TestTFHttpServer:

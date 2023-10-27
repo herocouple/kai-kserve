@@ -30,6 +30,7 @@ from .infer_type import InferRequest, InferResponse
 from ..constants import constants
 import time
 import logging
+from fastapi import Request, Response
 
 JSON_HEADERS = ["application/json", "application/cloudevents+json", "application/ld+json"]
 

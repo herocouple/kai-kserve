@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional, Dict
+from typing import Optional, Dict, Union
 
 from fastapi.requests import Request
 from fastapi.responses import Response
@@ -115,7 +115,7 @@ class V2Endpoints:
         model_name: str,
         request_body: InferenceRequest,
         model_version: Optional[str] = None
-    ) -> InferenceResponse:
+    ) -> Union[Response, InferenceResponse, Dict]:
         """Infer handler.
 
         Args:
@@ -152,10 +152,7 @@ class V2Endpoints:
                                                            response=response,
                                                            headers=response_headers, req_attributes={})
 
-        if response_headers:
-            raw_response.headers.update(response_headers)
-        res = InferenceResponse.parse_obj(response)
-        return res
+        return response
 
     async def load(self, model_name: str) -> Dict:
         """Model load handler.
